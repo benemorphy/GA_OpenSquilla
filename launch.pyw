@@ -1,4 +1,4 @@
-﻿import webview, threading, subprocess, sys, time, os, ctypes, atexit, socket, random
+import webview, threading, subprocess, sys, time, os, ctypes, atexit, socket, random
 
 WINDOW_WIDTH, WINDOW_HEIGHT, RIGHT_PADDING, TOP_PADDING = 600, 900, 0, 100
 
@@ -26,14 +26,14 @@ def inject(text):
     window.evaluate_js(f"""
         const textarea = document.querySelector('textarea[data-testid="stChatInputTextArea"]');
         if (textarea) {{
-            // 1. 鐢ㄥ師鐢?setter 璁剧疆鍊硷紙缁曡繃 React锛?
+            // 1. 用原生 setter 设置值（绕过 React）?
             const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
             nativeTextAreaValueSetter.call(textarea, {repr(text)});
-            // 2. 瑙﹀彂 React 鐨?input 浜嬩欢
+            // 2. 触发 React 的 input 事件
             textarea.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            // 3. 瑙﹀彂 change 浜嬩欢锛堟湁浜涚粍浠堕渶瑕侊級
+            // 3. 触发 change 事件（有些组件需要）
             textarea.dispatchEvent(new Event('change', {{ bubbles: true }}));
-            // 4. 寤惰繜鎻愪氦
+            // 4. 延迟提交
             setTimeout(() => {{
                 const btn = document.querySelector('[data-testid="stChatInputSubmitButton"]');
                 if (btn) {{btn.click();console.log('Submitted:', {repr(text)});}}
