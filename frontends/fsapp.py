@@ -632,6 +632,9 @@ def _build_step_detail(resp, tool_calls):
     return "\n\n".join(parts)
 
 
+V2_MODE = False  # --feishu2 时启用 output-first 卡片模式
+
+
 class _TaskCard:
     """飞书任务卡片：单卡片持续 patch；每步一个独立折叠面板（header 显示 summary，展开看详情）。"""
     _DETAIL_LIMIT = 8000
@@ -656,7 +659,14 @@ class _TaskCard:
         }
 
     def _build(self):
-        els = [{"tag": "markdown", "content": f"**{self.status}**"}]
+        if V2_MODE:
+            # --feishu2: output-first 卡片
+            topic = self.final[:60] if self.final else (
+                self.steps[-1][0][:60] if self.steps else self.status
+            )
+            els = [{"tag": "markdown", "content": f"**{topic}**"}]
+        else:
+            els = [{"tag": "markdown", "content": f"**{self.status}**"}]
         for i, (s, d) in enumerate(self.steps, 1):
             els.append(self._step_panel(i, s, d))
         if self.final:
@@ -873,7 +883,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="A3Agent Feishu frontend")
     parser.add_argument("--check", action="store_true", help="只检查飞书配置，不启动长连接")
     parser.add_argument("--check-agent", action="store_true", help="检查配置并初始化 Agent/LLM")
+    parser.add_argument("--feishu2", action="store_true", help="output-first 卡片模式")
     args = parser.parse_args()
+    V2_MODE = args.feishu2
     if args.check or args.check_agent:
         print(json.dumps(check_config(init_agent=args.check_agent), ensure_ascii=False, indent=2), flush=True)
     else:
