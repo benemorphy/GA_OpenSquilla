@@ -26,7 +26,7 @@ def inject(text):
     window.evaluate_js(f"""
         const textarea = document.querySelector('textarea[data-testid="stChatInputTextArea"]');
         if (textarea) {{
-            // 1. 用原生 setter 设置值（绕过 React）?
+            // 1. 用原生 setter 设置值（绕过 React）
             const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
             nativeTextAreaValueSetter.call(textarea, {json.dumps(text)});
             // 2. 触发 React 的 input 事件
@@ -76,7 +76,7 @@ def idle_monitor():
             last_reply = get_last_reply_time()
             if now - last_reply > 1800:
                 print('[Idle Monitor] Detected idle state, injecting task...')
-                inject("[AUTO]馃 鐢ㄦ埛宸茬粡绂诲紑瓒呰繃30鍒嗛挓锛屼綔涓鸿嚜涓绘櫤鑳戒綋锛岃闃呰鑷姩鍖杝op锛屾墽琛岃嚜鍔ㄤ换鍔°€?)
+                inject("[AUTO]🤖 用户已经离开超过30分钟，作为自主智能体，请阅读自动化sop，执行自动任务。")
                 last_trigger_time = now
         except Exception as e:
             print(f'[Idle Monitor] Error: {e}')
@@ -85,15 +85,14 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('port', nargs='?', default='0'); 
-    parser.add_argument('--tg', action='store_true', help='鍚姩 Telegram Bot'); 
-    parser.add_argument('--qq', action='store_true', help='鍚姩 QQ Bot');
-    parser.add_argument('--feishu', '--fs', dest='feishu', action='store_true', help='鍚姩 Feishu Bot');
-    parser.add_argument('--feishu2', action='store_true', help='鍚姩 Feishu Bot v2 (output-first card)');
-    parser.add_argument('--wechat', '--wx', dest='wechat', action='store_true', help='鍚姩 WeChat Bot');
-    parser.add_argument('--wecom', action='store_true', help='鍚姩 WeCom Bot');
-    parser.add_argument('--dingtalk', '--dt', dest='dingtalk', action='store_true', help='鍚姩 DingTalk Bot');
-    parser.add_argument('--sched', action='store_true', help='鍚姩璁″垝浠诲姟璋冨害鍣?)
-    parser.add_argument('--llm_no', type=int, default=0, help='LLM缂栧彿')
+    parser.add_argument('--tg', action='store_true', help='启动 Telegram Bot'); 
+    parser.add_argument('--qq', action='store_true', help='启动 QQ Bot');
+    parser.add_argument('--feishu', '--fs', dest='feishu', action='store_true', help='启动 Feishu Bot');
+    parser.add_argument('--wechat', '--wx', dest='wechat', action='store_true', help='启动 WeChat Bot');
+    parser.add_argument('--wecom', action='store_true', help='启动 WeCom Bot');
+    parser.add_argument('--dingtalk', '--dt', dest='dingtalk', action='store_true', help='启动 DingTalk Bot');
+    parser.add_argument('--sched', action='store_true', help='启动计划任务调度器')
+    parser.add_argument('--llm_no', type=int, default=0, help='LLM编号')
     args = parser.parse_args()
     port = str(find_free_port()) if args.port == '0' else args.port
     print(f'[Launch] Using port {port}')
@@ -116,11 +115,6 @@ if __name__ == '__main__':
         atexit.register(fsproc.kill)
         print('[Launch] Feishu Bot started')
     else: print('[Launch] Feishu Bot not enabled (use --feishu to start)')
-
-    if args.feishu2:
-        fs2proc = subprocess.Popen([sys.executable, os.path.join(frontends_dir, "fsapp2.py")], creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
-        atexit.register(fs2proc.kill)
-        print('[Launch] Feishu Bot v2 (output-first card) started')
 
     if args.wechat:
         wxproc = subprocess.Popen([sys.executable, os.path.join(frontends_dir, 'wechatapp.py')], creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
@@ -158,4 +152,3 @@ if __name__ == '__main__':
         width=WINDOW_WIDTH, height=WINDOW_HEIGHT, x=x_pos, y=TOP_PADDING,
         resizable=True, text_select=True)
     webview.start()
-
