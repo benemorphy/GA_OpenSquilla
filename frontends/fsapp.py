@@ -647,7 +647,7 @@ class _TaskCard:
         self.status = "🤔 思考中..."
         self.final = None
         self.msg_id = None
-		self.start_fallback_sent = False
+        self.start_fallback_sent = False
         self.final_fallback_sent = False
         self.page_no = 1
         self.turn_no = 0
