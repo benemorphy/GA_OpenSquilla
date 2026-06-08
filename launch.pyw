@@ -1,4 +1,4 @@
-import webview, threading, subprocess, sys, time, os, ctypes, atexit, socket, random
+import webview, threading, subprocess, sys, time, os, ctypes, atexit, socket, random, json
 
 WINDOW_WIDTH, WINDOW_HEIGHT, RIGHT_PADDING, TOP_PADDING = 600, 900, 0, 100
 
@@ -28,7 +28,7 @@ def inject(text):
         if (textarea) {{
             // 1. 用原生 setter 设置值（绕过 React）
             const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-            nativeTextAreaValueSetter.call(textarea, {repr(text)});
+            nativeTextAreaValueSetter.call(textarea, {json.dumps(text)});
             // 2. 触发 React 的 input 事件
             textarea.dispatchEvent(new Event('input', {{ bubbles: true }}));
             // 3. 触发 change 事件（有些组件需要）
@@ -36,7 +36,7 @@ def inject(text):
             // 4. 延迟提交
             setTimeout(() => {{
                 const btn = document.querySelector('[data-testid="stChatInputSubmitButton"]');
-                if (btn) {{btn.click();console.log('Submitted:', {repr(text)});}}
+                if (btn) {{btn.click();console.log('Submitted:', {json.dumps(text)});}}
             }}, 200);
         }}""")
 
