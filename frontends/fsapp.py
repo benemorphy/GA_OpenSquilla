@@ -636,9 +636,6 @@ def _build_step_detail(resp, tool_calls):
     return "\n\n".join(parts)
 
 
-V2_MODE = False  # --feishu2 时启用 output-first 卡片模式
-
-
 class _TaskCard:
     """飞书任务卡片：单卡片持续 patch；每步一个独立折叠面板（header 显示 summary，展开看详情）。"""
     _DETAIL_LIMIT = 8000
@@ -647,9 +644,11 @@ class _TaskCard:
     def __init__(self, receive_id, rid_type):
         self.rid, self.rtype = receive_id, rid_type
         self.steps = []          # [(summary, detail), ...]
-        self.status = "思考中..."
+        self.status = "🤔 思考中..."
         self.final = None
         self.msg_id = None
+		self.start_fallback_sent = False
+        self.final_fallback_sent = False
         self.page_no = 1
         self.turn_no = 0
         self.turn_base = 1
@@ -658,7 +657,7 @@ class _TaskCard:
     def _step_panel(self, idx, summary, detail):
         detail = detail or "_(无输出)_"
         if len(detail) > self._DETAIL_LIMIT:
-            detail = detail[:self._DETAIL_LIMIT] + f"\n\n...(已截断,共 {len(detail)} 字符)"
+            detail = detail[:self._DETAIL_LIMIT] + f"\n\n…(已截断,共 {len(detail)} 字符)"
         return {
             "tag": "collapsible_panel", "expanded": False,
             "header": {"title": {"tag": "plain_text", "content": f"Turn {idx} · {summary}"}},
