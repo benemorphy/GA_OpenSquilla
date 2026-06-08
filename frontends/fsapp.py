@@ -431,6 +431,10 @@ def _send_raw(receive_id, payload, msg_type, rtype):
 
 
 def _patch_card(message_id, card_json):
+    return _patch_card_result(message_id, card_json)[0]
+
+
+def _patch_card_result(message_id, card_json):
     try:
         body = PatchMessageRequest.builder().message_id(message_id).request_body(
             PatchMessageRequestBody.builder().content(card_json).build()
@@ -438,11 +442,11 @@ def _patch_card(message_id, card_json):
         r = client.im.v1.message.patch(body)
         if not r.success():
             print(f"[ERROR] patch_card 失败: {r.code}, {r.msg}")
-        return r.success()
+        msg = f"{getattr(r, 'code', '')} {getattr(r, 'msg', '')}".lower()
+        return r.success(), ("230099" in msg or "11310" in msg or "element exceeds the limit" in msg)
     except Exception as e:
-        print(f"[ERROR] patch_card exception: {e}")
-        traceback.print_exc()
-        return False
+        print(f"[ERROR] _patch_card 网络异常: {e}")
+        return False, False
 
 
 def send_message(receive_id, content, msg_type="text", use_card=False, receive_id_type="open_id"):
@@ -638,20 +642,23 @@ V2_MODE = False  # --feishu2 时启用 output-first 卡片模式
 class _TaskCard:
     """飞书任务卡片：单卡片持续 patch；每步一个独立折叠面板（header 显示 summary，展开看详情）。"""
     _DETAIL_LIMIT = 8000
+    _FINAL_LIMIT = 6000
 
     def __init__(self, receive_id, rid_type):
         self.rid, self.rtype = receive_id, rid_type
         self.steps = []          # [(summary, detail), ...]
-        self.status = "🤔 思考中..."
+        self.status = "思考中..."
         self.final = None
         self.msg_id = None
-        self.start_fallback_sent = False
-        self.final_fallback_sent = False
+        self.page_no = 1
+        self.turn_no = 0
+        self.turn_base = 1
+        self.note = None
 
     def _step_panel(self, idx, summary, detail):
         detail = detail or "_(无输出)_"
         if len(detail) > self._DETAIL_LIMIT:
-            detail = detail[:self._DETAIL_LIMIT] + f"\n\n…(已截断,共 {len(detail)} 字符)"
+            detail = detail[:self._DETAIL_LIMIT] + f"\n\n...(已截断,共 {len(detail)} 字符)"
         return {
             "tag": "collapsible_panel", "expanded": False,
             "header": {"title": {"tag": "plain_text", "content": f"Turn {idx} · {summary}"}},
@@ -659,15 +666,17 @@ class _TaskCard:
         }
 
     def _build(self):
-        if V2_MODE:
-            # --feishu2: output-first 卡片
-            topic = self.final[:60] if self.final else (
-                self.steps[-1][0][:60] if self.steps else self.status
-            )
-            els = [{"tag": "markdown", "content": f"**{topic}**"}]
-        else:
-            els = [{"tag": "markdown", "content": f"**{self.status}**"}]
-        for i, (s, d) in enumerate(self.steps, 1):
+        # output-first: 头部始终显示最新 topic (final output 或最新 step summary)，而非状态
+        topic = self.final[:60] if self.final else (
+            self.steps[-1][0][:60] if self.steps else self.status
+        )
+        header = f"**{topic}**"
+        if self.page_no > 1:
+            header += f"\n\n[工作卡片 {self.page_no}]"
+        els = [{"tag": "markdown", "content": header}]
+        if self.note:
+            els.append({"tag": "markdown", "content": self.note})
+        for i, (s, d) in enumerate(self.steps, self.turn_base):
             els.append(self._step_panel(i, s, d))
         if self.final:
             els += [{"tag": "hr"}, {"tag": "markdown", "content": self.final}]
@@ -676,40 +685,46 @@ class _TaskCard:
     def _push(self):
         card = self._build()
         if self.msg_id:
-            ok = _patch_card(self.msg_id, card)
+            return _patch_card_result(self.msg_id, card)
         else:
             self.msg_id = _send_raw(self.rid, card, "interactive", self.rtype)
-            ok = bool(self.msg_id)
-        return ok
+            return bool(self.msg_id), False
 
-    def _fallback_text(self, text, *, final=False):
-        attr = "final_fallback_sent" if final else "start_fallback_sent"
-        if getattr(self, attr):
-            return
-        setattr(self, attr, True)
-        send_message(self.rid, text, receive_id_type=self.rtype)
+    def _rollover(self):
+        self.page_no += 1
+        self.msg_id = None
+        self.final = None
+        self.note = "上一张工作卡片达到飞书限制，本页继续展示后续进展。"
 
     # ── 公开接口 ──
 
     def start(self):
-        if not self._push():
-            self._fallback_text("🤔 思考中...")
-
-    def step(self, summary, detail=""):
-        self.steps.append((summary, detail))
-        self.status = f"⏳ 工作中 · Turn {len(self.steps)}"
         self._push()
 
+    def step(self, summary, detail=""):
+        self.turn_no += 1
+        step = (summary, detail)
+        self.steps.append(step)
+        self.status = f"工作中 · Turn {self.turn_no}"
+        ok, limit = self._push()
+        if limit:
+            self.steps.pop()
+            self._rollover()
+            self.turn_base = self.turn_no
+            self.steps = [step]
+            self._push()
+
     def done(self, text):
-        self.status = "✅ 已完成"
-        self.final = text or "_(无文本输出)_"
-        if not self._push():
-            self._fallback_text(_display_text(text), final=True)
+        self.status = "已完成"
+        self.final = (text or "_(无文本输出)_")[:self._FINAL_LIMIT]
+        ok, limit = self._push()
+        if limit:
+            self._rollover()
+            self._push()
 
     def fail(self, msg):
-        self.status = f"❌ {msg}"
-        if not self._push():
-            self._fallback_text(f"❌ {msg}", final=True)
+        self.status = f"[{msg}]"
+        self._push()
 
 
 def _make_task_hook(card, task_id, on_final):
@@ -860,7 +875,8 @@ def main():
     if not APP_ID or not APP_SECRET:
         print(f"错误: 请在 mykey 配置中填写 fs_app_id 和 fs_app_secret\n配置文件: {CONFIG_PATH}", flush=True)
         sys.exit(1)
-    handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(handle_message).build()
+    encrypt_key = os.environ.get("FEISHU_ENCRYPT_KEY", "")
+    handler = lark.EventDispatcherHandler.builder(encrypt_key, "").register_p2_im_message_receive_v1(handle_message).build()
     retry_delay = 5
     while True:
         try:
