@@ -549,7 +549,27 @@ class BaseSession:
         self.api_mode = 'responses' if mode in ('responses', 'response') else 'chat_completions'
         self.temperature = cfg.get('temperature', 1)
         self.max_tokens = cfg.get('max_tokens')
+        self._tier = cfg.get('tier', 'c1')  # SquillaRouter tier
         self.default_ua = "claude-cli/2.1.152 (external, cli)"
+        self.user_agent = cfg.get("user_agent", self.default_ua)
+
+    def switch_model(self, model_name: str, tier: str = "c1"):
+        """热切换模型 (SquillaRouter 集成用)"""
+        old = self.model
+        self.model = model_name
+        self._tier = tier
+        from importlib import import_module
+        logging = import_module("logging")
+        logging.getLogger(__name__).info(f"[Router] Model switched: {old} -> {model_name} (tier={tier})")
+
+    def switch_tier(self, tier: str):
+        """通过 config 读取 mykey 多模型配置并切换"""
+        try:
+            from squilla_router.config import get_model_config
+            cfg = get_model_config(tier)
+            self.switch_model(cfg["model"], tier)
+        except ImportError:
+            pass
         self.user_agent = cfg.get("user_agent", self.default_ua)
     def _apply_claude_thinking(self, payload):
         if self.thinking_type:
@@ -1013,6 +1033,17 @@ class NativeToolClient:
         self.name = self.backend.name
         self._pending_tool_ids = []
         self.log_path = None
+    @property
+    def model(self):
+        return getattr(self.backend, 'model', '')
+    def switch_model(self, model_name, tier=None):
+        """代理到 backend.switch_model (SquillaRouter 集成)"""
+        if hasattr(self.backend, 'switch_model'):
+            self.backend.switch_model(model_name, tier or '')
+    def switch_tier(self, tier):
+        """代理到 backend.switch_tier (SquillaRouter 集成)"""
+        if hasattr(self.backend, 'switch_tier'):
+            self.backend.switch_tier(tier)
     def set_system(self, extra_system):
         combined = f"{extra_system}\n\n{self._thinking_prompt()}" if extra_system else self._thinking_prompt()
         if combined != self.backend.system: print(f"[Debug] Updated system prompt, length {len(combined)} chars.")

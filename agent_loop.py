@@ -1,8 +1,26 @@
-import json, re, os
+import json, re, os, logging
 from dataclasses import dataclass
 from typing import Any, Optional
 try: from plugins.hooks import trigger as _hook
 except ImportError: _hook = lambda *a, **k: None
+
+# ── SquillaRouter 集成 ──────────────────────────────────
+_ROUTER_ENABLED = False  # 可通过环境变量开启
+_ROUTER = None
+
+def _init_router():
+    global _ROUTER, _ROUTER_ENABLED
+    if _ROUTER is not None:
+        return
+    try:
+        from squilla_router import CascadeRouter, get_router
+        _ROUTER = get_router()
+        _ROUTER_ENABLED = os.environ.get("SQUILLA_ROUTER", "").lower() in ("1", "true", "yes")
+        if _ROUTER_ENABLED:
+            logging.getLogger(__name__).info("[Router] SquillaRouter enabled")
+    except ImportError as e:
+        logging.getLogger(__name__).debug(f"[Router] squilla_router not available: {e}")
+        _ROUTER = None
 @dataclass
 class StepOutcome:
     data: Any
@@ -41,6 +59,7 @@ def get_pretty_json(data):
 
 def agent_runner_loop(client, system_prompt, user_input, handler, tools_schema, 
                       max_turns=40, verbose=True, initial_user_content=None, yield_info=False):
+    _init_router()
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": initial_user_content if initial_user_content is not None else user_input}
@@ -54,6 +73,42 @@ def agent_runner_loop(client, system_prompt, user_input, handler, tools_schema,
         if yield_info: yield {'turn': turn}
         yield f"\n\n{turnstr}\n\n"
         if turn%10 == 0: client.last_tools = ''  # 每10轮重置一次工具描述
+
+        # ── SquillaRouter: 每轮自动路由决策 ──────────────────
+        if _ROUTER_ENABLED and _ROUTER is not None:
+            try:
+                # 提取本轮文本做路由
+                curr_text = ""
+                for m in reversed(messages):
+                    if isinstance(m.get('content'), str):
+                        curr_text = m['content']
+                        break
+                    elif isinstance(m.get('content'), list):
+                        for block in m['content']:
+                            if isinstance(block, dict) and block.get('type') == 'text':
+                                curr_text = block.get('text', '')
+                                break
+                        if curr_text:
+                            break
+                decision = _ROUTER.decide(
+                    current_text=curr_text,
+                    history_texts=[str(m.get('content',''))[:200] for m in messages[-6:-1]],
+                )
+                # 如果路由推荐的模型与当前不同，切换模型
+                if decision.model != client.model:
+                    old_model = client.model
+                    client.switch_model(decision.model, decision.tier)
+                    if verbose:
+                        latency = f"{decision.latency_ms:.0f}" if decision.latency_ms else "?"
+                        yield f"[Router] {old_model} -> {decision.model} (tier={decision.tier}, traj={decision.trajectory}, {latency}ms)\n\n"
+                else:
+                    # 埋点: 路由决策但无需切换
+                    if _ROUTER_ENABLED and verbose:
+                        yield f"[Router] keep {client.model} (tier={decision.tier}, traj={decision.trajectory})\n\n"
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"[Router] 路由决策失败: {e}")
+        # ──────────────────────────────────────────────────────
+
         _hook('turn_before', locals())
         _hook('llm_before', locals())
         response_gen = client.chat(messages=messages, tools=tools_schema)

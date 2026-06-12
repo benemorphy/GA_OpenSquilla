@@ -66,10 +66,13 @@ PASTE_HOOK_JS = """if (!window._pasteHooked) { window._pasteHooked = true;
 }"""
 
 def idle_monitor():
+    global window
     last_trigger_time = 0
     while True:
         time.sleep(5)
         try:
+            if 'window' not in globals() or window is None:
+                continue
             window.evaluate_js(PASTE_HOOK_JS)
             now = time.time()
             if now - last_trigger_time < 120: continue
@@ -80,6 +83,101 @@ def idle_monitor():
                 last_trigger_time = now
         except Exception as e:
             print(f'[Idle Monitor] Error: {e}')
+
+MUTEX_NAMES = [
+    "Global\\GenericAgent_LaunchMutex",
+    "GenericAgent_LaunchMutex",
+]
+LOCK_FILE = os.path.join(script_dir, ".launch.lock")
+
+def _pid_exists(pid):
+    """跨平台PID存在性检查"""
+    try:
+        if os.name == 'nt':
+            handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            return False
+        else:
+            os.kill(pid, 0)
+            return True
+    except (OSError, ProcessLookupError, AttributeError):
+        return False
+
+def _check_lock_file():
+    """PID锁文件：跨Python环境防重复启动"""
+    if not os.path.exists(LOCK_FILE):
+        return None
+    try:
+        with open(LOCK_FILE) as f:
+            old_pid = int(f.read().strip())
+        if old_pid == os.getpid():
+            return None  # 自身
+        if _pid_exists(old_pid):
+            return old_pid  # 其他实例存活
+        # PID不存在，锁文件过期
+        return None
+    except (ValueError, OSError):
+        return None
+
+def ensure_single_instance():
+    """防重复启动：Mutex名回退 + PID锁文件 + 竞态退避"""
+    import random as _random
+    time.sleep(_random.uniform(0, 0.3))  # 竞态退避
+    
+    # 1) PID锁文件辅助（跨venv/uv可靠）
+    old_pid = _check_lock_file()
+    if old_pid:
+        print(f'[Launch] Another instance (PID {old_pid}) running via lock file, exiting.')
+        sys.exit(0)
+    # 写入当前PID
+    with open(LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    def _cleanup_lock():
+        try:
+            if os.path.exists(LOCK_FILE):
+                with open(LOCK_FILE) as f:
+                    cur = f.read().strip()
+                if cur == str(os.getpid()):
+                    os.remove(LOCK_FILE)
+        except: pass
+    atexit.register(_cleanup_lock)
+    
+    # 2) Windows Mutex（带名回退，某些受限环境Global\无效）
+    for mutex_name in MUTEX_NAMES:
+        try:
+            ctypes.windll.kernel32.SetLastError(0)
+            mutex = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+            err = ctypes.windll.kernel32.GetLastError()
+            
+            if err == 183:  # ERROR_ALREADY_EXISTS
+                print(f'[Launch] Another instance running (mutex: {mutex_name})')
+                if mutex:
+                    ctypes.windll.kernel32.CloseHandle(mutex)
+                sys.exit(0)
+            
+            if mutex:
+                print(f'[Launch] Instance lock acquired: {mutex_name}')
+                atexit.register(lambda h=mutex: ctypes.windll.kernel32.CloseHandle(h))
+                return  # 成功
+        except Exception as e:
+            print(f'[Launch] Mutex error on {mutex_name}: {e}')
+            continue
+    
+    print('[Launch] All mutex names failed, lock file only')
+
+def wait_for_port(port, timeout=30):
+    """等待streamlit实际监听端口后再打开窗口"""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            s = socket.socket(); s.settimeout(1)
+            s.connect(('127.0.0.1', port)); s.close()
+            return True
+        except:
+            time.sleep(0.3)
+    return False
 
 if __name__ == '__main__':
     import argparse
@@ -94,6 +192,7 @@ if __name__ == '__main__':
     parser.add_argument('--sched', action='store_true', help='启动计划任务调度器')
     parser.add_argument('--llm_no', type=int, default=0, help='LLM编号')
     args = parser.parse_args()
+    ensure_single_instance()
     port = str(find_free_port()) if args.port == '0' else args.port
     print(f'[Launch] Using port {port}')
     threading.Thread(target=start_streamlit, args=(port,), daemon=True).start()
@@ -146,7 +245,9 @@ if __name__ == '__main__':
         screen_width = get_screen_width()
         x_pos = screen_width - WINDOW_WIDTH - RIGHT_PADDING
     else: x_pos = 100
-    time.sleep(2) 
+    print(f'[Launch] Waiting for streamlit on port {port}...')
+    if not wait_for_port(int(port)):
+        print(f'[Launch] Warning: streamlit did not start within timeout, continuing anyway')
     window = webview.create_window(
         title='GenericAgent', url=f'http://localhost:{port}',
         width=WINDOW_WIDTH, height=WINDOW_HEIGHT, x=x_pos, y=TOP_PADDING,
