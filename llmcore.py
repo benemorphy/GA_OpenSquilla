@@ -798,6 +798,20 @@ class ToolClient:
         self.total_cd_tokens = 0
         self.log_path = None
 
+    @property
+    def model(self):
+        return getattr(self.backend, 'model', '')
+
+    def switch_model(self, model_name, tier=None):
+        """代理到 backend.switch_model (SquillaRouter 集成)"""
+        if hasattr(self.backend, 'switch_model'):
+            self.backend.switch_model(model_name, tier or '')
+
+    def switch_tier(self, tier):
+        """代理到 backend.switch_tier (SquillaRouter 集成)"""
+        if hasattr(self.backend, 'switch_tier'):
+            self.backend.switch_tier(tier)
+
     def chat(self, messages, tools=None):
         tools = json.loads(json.dumps(tools, ensure_ascii=False)) if tools else tools
         for t in tools or []:

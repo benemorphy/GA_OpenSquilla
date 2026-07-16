@@ -9,28 +9,28 @@ _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 TIER_MODEL_MAP = {
     "c0": {
         "provider": "native_oai",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "max_tokens": 4096,
         "reasoning": False,
         "description": "极轻量模型 - 简单问答/翻译",
     },
     "c1": {
         "provider": "native_oai",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "max_tokens": 8192,
         "reasoning": False,
         "description": "中等模型 - 常规对话",
     },
     "c2": {
         "provider": "native_oai",
-        "model": "deepseek-v4-pro",
+        "model": "deepseek-v4-flash",
         "max_tokens": 32768,
         "reasoning": False,
         "description": "强模型(Pro) - 复杂推理/代码",
     },
     "c3": {
         "provider": "native_oai",
-        "model": "deepseek-reasoner",
+        "model": "deepseek-v4-pro",
         "max_tokens": 32768,
         "reasoning": True,
         "description": "最强模型+深度思考 - 高难度分析",
