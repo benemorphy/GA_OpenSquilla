@@ -14,10 +14,12 @@ except Exception: pass
 from ga import GenericAgentHandler, smart_format, get_global_memory, format_error, consume_file
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
+BANNED_TOOLS = (['ask_user', 'start_long_term_update'] if '--no-user-tools' in sys.argv else [])
 def load_tool_schema(suffix=''):
     global TOOLS_SCHEMA
     TS = open(os.path.join(script_dir, f'assets/tools_schema{suffix}.json'), 'r', encoding='utf-8').read()
     TOOLS_SCHEMA = json.loads(TS if os.name == 'nt' else TS.replace('powershell', 'bash'))
+    TOOLS_SCHEMA = [t for t in TOOLS_SCHEMA if t.get('function', {}).get('name') not in BANNED_TOOLS]
 load_tool_schema()
 
 lang_suffix = '_en' if os.environ.get('GA_LANG', '') == 'en' else ''
@@ -60,6 +62,8 @@ class GenericAgent:
         logid = f'{(time.time_ns() + random.randrange(1_000_000)) % 1_000_000:06d}'
         self.log_path = os.path.join(script_dir, f'temp/model_responses/model_responses_{logid}.txt')
         self.load_llm_sessions()
+        self.extra_sys_prompts = []
+        self.intervene = self.extrakeyinfo = None
 
     def load_llm_sessions(self):
         mykeys, changed = reload_mykeys()
@@ -79,7 +83,7 @@ class GenericAgent:
                     mixin = MixinSession(llm_sessions, s['mixin_cfg'])
                     if isinstance(mixin._sessions[0], (NativeClaudeSession, NativeOAISession)): llm_sessions[i] = NativeToolClient(mixin)
                     else: llm_sessions[i] = ToolClient(mixin)
-                except Exception as e: 
+                except Exception as e:
                     print(f'\n\n\n[ERROR] Failed to init MixinSession with cfg {s["mixin_cfg"]}: {e}!!!\n\n')
                     llm_sessions[i] = None  # mark for removal
         llm_sessions = [s for s in llm_sessions if s is not None]  # remove failed entries
@@ -88,7 +92,7 @@ class GenericAgent:
             self.llmclient = None
         else:
             self.llmclient = self.llmclients[self.llm_no%len(self.llmclients)]
-        if oldhistory: self.llmclient.backend.history = oldhistory
+            if oldhistory: self.llmclient.backend.history = oldhistory
     
     def next_llm(self, n=-1):
         self.load_llm_sessions()
@@ -109,6 +113,7 @@ class GenericAgent:
         if isinstance(b, dict): return 'BADCONFIG_MIXIN'
         if model: return b.backend.model.lower()
         return f"{type(b.backend).__name__}/{b.backend.name}"
+    def get_ctx_multiplier(self): return getattr(self.llmclient.backend, 'maxlen_multiplier', 1.0)
 
     def abort(self):
         if not self.is_running: return
@@ -152,8 +157,7 @@ class GenericAgent:
                 raw_query = f'Long user prompt saved to {task_file}. Read and execute.'
             rquery = smart_format(raw_query.replace('\n', ' '), max_str_len=200)
             self.history.append(f"[USER]: {rquery}")
-            
-            sys_prompt = get_system_prompt() + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
+            sys_prompt = get_system_prompt() + '\n'.join(self.extra_sys_prompts) + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
             if self.peer_hint: sys_prompt += f"\n[Peer] 用户提及其他会话/后台任务状态时: temp/model_responses/ (只找近期修改的文件尾部)\n"
             handler = GenericAgentHandler(self, self.history, os.path.join(script_dir, 'temp'))
             if getattr(self, 'no_print', False): handler.print = lambda *a, **k: None
@@ -244,8 +248,8 @@ if __name__ == '__main__':
                 if 'next' in item and random.random() < 0.95:  # 概率写一次中间结果
                     with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item.get('next', ''))
             with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item['done'] + '\n\n[ROUND END]\n')
-            consume_file(d, '_stop')  # 已经成功停下来了，避免打断下次reply
-            for _ in range(300):  # 等reply.txt，10分钟超时
+            consume_file(d, '_stop')
+            for _ in range(300):
                 time.sleep(2)
                 if (raw := consume_file(d, 'reply.txt')): break
             else: break
@@ -257,15 +261,8 @@ if __name__ == '__main__':
         spec = importlib.util.spec_from_file_location('reflect_script', args.reflect)
         mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
         if hasattr(mod, 'init'): mod.init(_reflect_args)
-        _mt = os.path.getmtime(args.reflect)
         print(f'[Reflect] loaded {args.reflect}' + (f' args={_reflect_args}' if _reflect_args else ''))
         while True:
-            if os.path.getmtime(args.reflect) != _mt:
-                try:
-                    spec.loader.exec_module(mod); _mt = os.path.getmtime(args.reflect)
-                    if hasattr(mod, 'init'): mod.init(_reflect_args)
-                    print('[Reflect] reloaded')
-                except Exception as e: print(f'[Reflect] reload error: {e}')
             try: task = mod.check()
             except Exception as e: 
                 print(f'[Reflect] check() error: {e}'); task = None
