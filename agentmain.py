@@ -1,4 +1,4 @@
-import os, sys, threading, queue, time, json, re, random, locale
+import os, sys, threading, queue, time, json, re, random, locale, glob
 os.environ.setdefault('GA_LANG', 'zh' if any(k in (locale.getlocale()[0] or '').lower() for k in ('zh', 'chinese')) else 'en')
 if sys.stdout is None: sys.stdout = open(os.devnull, "w")
 elif hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(errors='replace')
@@ -53,14 +53,18 @@ class GenericAgent:
         os.makedirs(os.path.join(script_dir, 'temp'), exist_ok=True)
         self.lock = threading.Lock()
         self.task_dir = None
-        self.history = []; self.handler = None; 
+        self.history = []; self.handler = None; self.all_outputs = []
         self.task_queue = queue.Queue() 
-        self.is_running = False; self.stop_sig = False; self.llm_no = 0;  
+        self.is_running = False; self.stop_sig = False; self.llm_no = 0;
+        # Output queue of the task currently executing (None when idle). Lets a UI that
+        # lost its own handle (page refresh, second client) re-attach to the live task.
+        self._current_queue = None  
         self.inc_out = False; self.verbose = True
         self.peer_hint = True
         self.force_non_stream = False
         logid = f'{(time.time_ns() + random.randrange(1_000_000)) % 1_000_000:06d}'
         self.log_path = os.path.join(script_dir, f'temp/model_responses/model_responses_{logid}.txt')
+        self.llmclient = None
         self.load_llm_sessions()
         self.extra_sys_prompts = []
         self.intervene = self.extrakeyinfo = None
@@ -68,8 +72,8 @@ class GenericAgent:
     def load_llm_sessions(self):
         mykeys, changed = reload_mykeys()
         if not changed and hasattr(self, 'llmclients'): return
-        try: oldhistory = self.llmclient.backend.history
-        except: oldhistory = None
+        try: oldhistory, oldname = self.llmclient.backend.history, self.llmclient.backend.name
+        except: oldhistory = oldname = None
         llm_sessions = []
         for k, cfg in mykeys.items():
             if not any(x in k for x in ['api', 'config', 'cookie']): continue
@@ -88,14 +92,15 @@ class GenericAgent:
                     llm_sessions[i] = None  # mark for removal
         llm_sessions = [s for s in llm_sessions if s is not None]  # remove failed entries
         self.llmclients = llm_sessions
-        if not self.llmclients:
-            self.llmclient = None
-        else:
-            self.llmclient = self.llmclients[self.llm_no%len(self.llmclients)]
-            if oldhistory: self.llmclient.backend.history = oldhistory
+        if not self.llmclients: return
+        names = [c.backend.name if not isinstance(c, dict) else f'BADMIXIN_{i}' for i, c in enumerate(self.llmclients)]
+        if oldname in names: self.llm_no = names.index(oldname)
+        self.llmclient = self.llmclients[self.llm_no%len(self.llmclients)]
+        if oldhistory: self.llmclient.backend.history = oldhistory
     
     def next_llm(self, n=-1):
         self.load_llm_sessions()
+        if not self.llmclients: return
         self.llm_no = ((self.llm_no + 1) if n < 0 else n) % len(self.llmclients)
         lastc = self.llmclient
         self.llmclient = self.llmclients[self.llm_no]
@@ -112,7 +117,7 @@ class GenericAgent:
         b = self.llmclient if b is None else b
         if isinstance(b, dict): return 'BADCONFIG_MIXIN'
         if model: return b.backend.model.lower()
-        return f"{type(b.backend).__name__}/{b.backend.name}"
+        return f"{type(b.backend).__name__.replace('Session', '')}/{b.backend.name}"
     def get_ctx_multiplier(self): return getattr(self.llmclient.backend, 'maxlen_multiplier', 1.0)
 
     def abort(self):
@@ -120,6 +125,10 @@ class GenericAgent:
         print('Abort current task...')
         self.stop_sig = True
         if self.handler is not None: self.handler.code_stop_signal.append(1)
+        for sess in getattr(self.llmclient.backend, '_sessions', [self.llmclient.backend]):
+            sess.should_stop = lambda: self.stop_sig  # live read; cleared by run()'s finally
+            try: sess.active_response.close()
+            except Exception: pass
             
     def put_task(self, query, source="user", images=None):
         display_queue = queue.Queue()
@@ -150,11 +159,13 @@ class GenericAgent:
             raw_query = self._handle_slash_cmd(raw_query, display_queue)
             if raw_query is None:
                 self.task_queue.task_done(); continue
-            self.is_running = True
+            self.is_running = True; self._current_queue = display_queue
             if len(raw_query) > 2000:
-                task_file = os.path.join(script_dir, 'temp', f'user_prompt_{int(time.time())}.md')
+                task_file = os.path.join(script_dir, 'temp', f'user_prompt_{os.getpid()}_{time.time_ns()}.md')
                 with open(task_file, 'w', encoding='utf-8') as f: f.write(raw_query)
                 raw_query = f'Long user prompt saved to {task_file}. Read and execute.'
+            self.all_outputs.append({"input": raw_query, "outputs": []})
+            if len(self.all_outputs) > 10000: self.all_outputs = self.all_outputs[-5000:]
             rquery = smart_format(raw_query.replace('\n', ' '), max_str_len=200)
             self.history.append(f"[USER]: {rquery}")
             sys_prompt = get_system_prompt() + '\n'.join(self.extra_sys_prompts) + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
@@ -172,9 +183,9 @@ class GenericAgent:
                 self.llmclient.backend.stream = False
                 self.llmclient.backend.read_timeout = max(self.llmclient.backend.read_timeout, 1200)
             gen = agent_runner_loop(self.llmclient, sys_prompt, raw_query, handler, TOOLS_SCHEMA, 
-                                    max_turns=80, verbose=self.verbose, yield_info=True)
+                                    max_turns=180, verbose=self.verbose, yield_info=True)
             try:
-                full_resp = ""; last_pos = 0; curr_turn = 0; turn_resps = []
+                full_resp = ""; last_pos = 0; curr_turn = 0; turn_resps = self.all_outputs[-1]["outputs"]
                 for chunk in gen:
                     if consume_file(self.task_dir, '_stop'): self.abort() 
                     if self.stop_sig: break
@@ -197,7 +208,7 @@ class GenericAgent:
                 display_queue.put({'done': full_resp + f'\n```\n{format_error(e)}\n```', 'source': source, 'turn': curr_turn, 'outputs': turn_resps.copy()})
             finally:
                 if self.stop_sig: print('User aborted the task.')
-                self.is_running = self.stop_sig = False
+                self.is_running = self.stop_sig = False  # keep _current_queue: its final 'done' may still be unclaimed (refreshed UI salvages it); next task overwrites it
                 self.task_queue.task_done()
                 if self.handler is not None: self.handler.code_stop_signal.append(1)
 
@@ -207,84 +218,106 @@ if __name__ == '__main__':
     import argparse
     from datetime import datetime
     parser = argparse.ArgumentParser()
-    parser.add_argument('--task', metavar='IODIR', help='一次性任务模式(文件IO)')
+    parser.add_argument('--task', metavar='IODIR', help='一次性任务模式，先看subagent.md')
+    parser.add_argument('--func', metavar='PROMPT_FILE', help='纯函数模式：读prompt文件→结果写prompt.out.txt→退出')
     parser.add_argument('--reflect', metavar='SCRIPT', help='反射模式：加载监控脚本，check()触发时发任务')
     parser.add_argument('--input', help='prompt')
+    parser.add_argument('--history', help='history json file')
     parser.add_argument('--llm_no', type=int, default=0)
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--nobg', action='store_true')
+    parser.add_argument('--nolog', action='store_true')
+    parser.add_argument('--no-user-tools', action='store_true')
     args, _unknown = parser.parse_known_args()
-    _reflect_args = dict(zip([k.lstrip('-') for k in _unknown[::2]], _unknown[1::2])) if _unknown else {}
+    _extra_args = dict(zip([k.lstrip('-') for k in _unknown[::2]], _unknown[1::2])) if _unknown else {}
 
-    if args.task and not args.nobg:
+    if (args.func or args.task) and not args.nobg:
         import subprocess, platform
         cmd = [sys.executable, os.path.abspath(__file__)] + [a for a in sys.argv[1:]] + ['--nobg']
-        d = os.path.join(script_dir, f'temp/{args.task}'); os.makedirs(d, exist_ok=True)
+        if args.task:
+            d = os.path.join(script_dir, f'temp/{args.task}'); os.makedirs(d, exist_ok=True)
+            out = open(os.path.join(d, 'stdout.log'), 'w', encoding='utf-8')
+            err = open(os.path.join(d, 'stderr.log'), 'w', encoding='utf-8')
+        else: out, err = subprocess.DEVNULL, subprocess.DEVNULL
         p = subprocess.Popen(cmd, cwd=script_dir,
             creationflags=0x08000000 if platform.system() == 'Windows' else 0,
-            stdout=open(os.path.join(d, 'stdout.log'), 'w', encoding='utf-8'),
-            stderr=open(os.path.join(d, 'stderr.log'), 'w', encoding='utf-8'))
+            stdout=out, stderr=err)
         print('PID:', p.pid); sys.exit(0)
 
-    agent = GeneraticAgent()
+    agent = GenericAgent()
+    if args.nolog: agent.log_path = False
     agent.next_llm(args.llm_no)
     agent.verbose = args.verbose
     threading.Thread(target=agent.run, daemon=True).start()
 
+    histfile = args.history
     if args.task:
-        agent.peer_hint = False
-        agent.force_non_stream = True
         agent.task_dir = d = os.path.join(script_dir, f'temp/{args.task}'); nround = ''
-        infile = os.path.join(d, 'input.txt')
+        infile = os.path.join(d, 'input.txt'); outfile = f'{d}/output{nround}.txt'
         if args.input:
             os.makedirs(d, exist_ok=True)
-            import glob; [os.remove(f) for f in glob.glob(os.path.join(d, 'output*.txt'))]
+            [os.remove(f) for f in glob.glob(os.path.join(d, 'output*.txt'))]
             with open(infile, 'w', encoding='utf-8') as f: f.write(args.input)
-        if (fh := consume_file(d, '_history.json')): agent.llmclient.backend.history = json.loads(fh)
+        histfile = histfile or os.path.join(d, '_history.json')
+    elif args.func:
+        infile = args.func; outfile = os.path.splitext(args.func)[0] + '.out.txt'
+
+    if histfile and os.path.isfile(histfile): agent.llmclient.backend.history = json.loads(open(histfile, encoding='utf-8').read())
+
+    if args.func or args.task:
+        agent.peer_hint = False
         with open(infile, encoding='utf-8') as f: raw = f.read()
         while True:
-            dq = agent.put_task(raw, source='task')
-            while 'done' not in (item := dq.get(timeout=1200)): 
-                if 'next' in item and random.random() < 0.95:  # 概率写一次中间结果
-                    with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item.get('next', ''))
-            with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item['done'] + '\n\n[ROUND END]\n')
-            consume_file(d, '_stop')
-            for _ in range(300):
+            dq = agent.put_task(raw, source='func' if args.func else 'task')
+            while 'done' not in (item := dq.get(timeout=2200)):
+                if 'next' in item:
+                    with open(outfile, 'w', encoding='utf-8') as f: f.write(item.get('next', ''))
+            with open(outfile, 'w', encoding='utf-8') as f: f.write(item['done'] + '\n\n[ROUND END]\n')
+            if not args.task: break
+            consume_file(d, '_stop')  # 已经成功停下来了，避免打断下次reply
+            for _ in range(300):  # 等reply.txt，10分钟超时
                 time.sleep(2)
                 if (raw := consume_file(d, 'reply.txt')): break
             else: break
             nround = nround + 1 if isinstance(nround, int) else 1
+            outfile = f'{d}/output{nround}.txt'
     elif args.reflect:
         agent.peer_hint = False
-        agent.force_non_stream = True
         import importlib.util
         spec = importlib.util.spec_from_file_location('reflect_script', args.reflect)
         mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-        if hasattr(mod, 'init'): mod.init(_reflect_args)
-        print(f'[Reflect] loaded {args.reflect}' + (f' args={_reflect_args}' if _reflect_args else ''))
+        if hasattr(mod, 'init'): mod.init(_extra_args)
+        _mt = os.path.getmtime(args.reflect)
+        print(f'[Reflect] loaded {args.reflect}' + (f' args={_extra_args}' if _extra_args else ''))
         while True:
+            if os.path.getmtime(args.reflect) != _mt:
+                try:
+                    spec.loader.exec_module(mod); _mt = os.path.getmtime(args.reflect)
+                    if hasattr(mod, 'init'): mod.init(_extra_args)
+                    print('[Reflect] reloaded')
+                except Exception as e: print(f'[Reflect] reload error: {e}')
             try: task = mod.check()
             except Exception as e: 
                 print(f'[Reflect] check() error: {e}'); task = None
             if task and task == '/exit': break
-            if not task:
-                time.sleep(getattr(mod, 'INTERVAL', 5)); continue
-            print(f'[Reflect] triggered: {task[:80]}')
-            dq = agent.put_task(task, source='reflect')
-            try:
-                while 'done' not in (item := dq.get(timeout=1200)): pass
-                result = item['done']
-                print(result)
-            except Exception as e:
-                if getattr(mod, 'ONCE', False): raise
-                print(f'[Reflect] drain error: {e}'); result = f'[ERROR] {e}'
-            log_dir = os.path.join(script_dir, 'temp/reflect_logs'); os.makedirs(log_dir, exist_ok=True)
-            script_name = os.path.splitext(os.path.basename(args.reflect))[0]
-            open(os.path.join(log_dir, f'{script_name}_{datetime.now():%Y-%m-%d}.log'), 'a', encoding='utf-8').write(f'[{datetime.now():%m-%d %H:%M}]\n{result}\n\n')
-            if (on_done := getattr(mod, 'on_done', None)):
-                try: on_done(result)
-                except Exception as e: print(f'[Reflect] on_done error: {e}')
-            if getattr(mod, 'ONCE', False): print('[Reflect] ONCE=True, exiting.'); break
+            if task:
+                print(f'[Reflect] triggered: {task[:80]}')
+                dq = agent.put_task(task, source='reflect')
+                try:
+                    while 'done' not in (item := dq.get(timeout=2200)): pass
+                    result = item['done']
+                    print(result)
+                except Exception as e:
+                    if getattr(mod, 'ONCE', False): raise
+                    print(f'[Reflect] drain error: {e}'); result = f'[ERROR] {e}'
+                log_dir = os.path.join(script_dir, 'temp/reflect_logs'); os.makedirs(log_dir, exist_ok=True)
+                script_name = os.path.splitext(os.path.basename(args.reflect))[0]
+                open(os.path.join(log_dir, f'{script_name}_{datetime.now():%Y-%m-%d}.log'), 'a', encoding='utf-8').write(f'[{datetime.now():%m-%d %H:%M}]\n{result}\n\n')
+                if (on_done := getattr(mod, 'on_done', None)):
+                    try: on_done(result)
+                    except Exception as e: print(f'[Reflect] on_done error: {e}')
+                if getattr(mod, 'ONCE', False): print('[Reflect] ONCE=True, exiting.'); break
+            time.sleep(getattr(mod, 'INTERVAL', 5))
     else:
         try: import readline
         except Exception: pass
@@ -307,5 +340,4 @@ if __name__ == '__main__':
                     if 'next' in item: print(item['next'], end='', flush=True)
                     if 'done' in item: print(); break
             except KeyboardInterrupt:
-                agent.abort()
-                print('\n[Interrupted]')
+                agent.abort(); print('\n[Interrupted]')
