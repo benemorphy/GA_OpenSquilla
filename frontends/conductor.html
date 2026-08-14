@@ -336,7 +336,7 @@
     let ws;
 
     function esc(s){ return String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-    function renderMd(s){ try { return marked.parse(s||'', { breaks: true, gfm: true }); } catch(e){ return esc(s); } }
+    function renderMd(s){ try { return marked.parse(String(s||'').replace(/</g,'&lt;'), { breaks: true, gfm: true }); } catch(e){ return esc(s); } }
 
     /* ---------- subagent 卡片 ---------- */
     function renderCards(items){
