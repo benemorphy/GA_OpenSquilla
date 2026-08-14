@@ -3,5 +3,6 @@
 from squilla_router.cascade_router import (
     CascadeRouter, RouterDecision, get_router, route_decision,
     TIER_ORDER, DEFAULT_TIER, normalize_text_tier, tier_index,
+    lock_tier, unlock_tier,
 )
-from squilla_router.config import TIER_MODEL_MAP, get_model_config, list_tiers
+from squilla_router.config import TIER_MODEL_MAP, get_model_config, list_tiers, upgear, downgear, gear_status

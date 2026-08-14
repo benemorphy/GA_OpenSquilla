@@ -137,6 +137,10 @@ class CascadeRouter:
         # 3. 应用 sticky tier (防抖)
         tier = self._apply_sticky(tier)
 
+        # 3.5 强制锁定: 如果全局锁已设置，覆盖路由决策
+        if _DEFAULT_TIER_LOCK is not None:
+            tier = _DEFAULT_TIER_LOCK
+
         # 4. 级联降级: 确保模型可用
         final_tier = self._cascade(tier, available_tiers)
 
@@ -238,8 +242,20 @@ class CascadeRouter:
         }
 
 
-# ── 便捷函数 ──────────────────────────────────────────
-_DEFAULT_ROUTER: Optional[CascadeRouter] = None
+_DEFAULT_TIER_LOCK: str | None = None
+_DEFAULT_ROUTER: Optional['CascadeRouter'] = None
+
+def lock_tier(tier: str):
+    """锁定模型层级，路由器将始终返回该tier"""
+    global _DEFAULT_TIER_LOCK
+    t = normalize_text_tier(tier)
+    if t:
+        _DEFAULT_TIER_LOCK = t
+
+def unlock_tier():
+    """解锁，恢复路由器自动决策"""
+    global _DEFAULT_TIER_LOCK
+    _DEFAULT_TIER_LOCK = None
 
 def get_router() -> CascadeRouter:
     global _DEFAULT_ROUTER

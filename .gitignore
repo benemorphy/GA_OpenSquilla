@@ -114,6 +114,21 @@ memory/L4_raw_sessions/*
 # Review Mode SOP
 !memory/review_sop.md
 
+# OpenAI4S 吸收科研工具 (2026-08-14)
+!memory/sci_methods.py
+!memory/ml_experiment_sop.md
+!memory/scientific_data_diagnosis_sop.md
+!memory/literature_review_sop.md
+!memory/figure_composer_sop.md
+!memory/model_evaluation_sop.md
+
+# FreeFileSync 同步配置（本机工具状态，不入库）
+sync.ffs_db
+# SquillaRouter 齿轮偏移运行时状态
+squilla_router/.gear_offset
+# 上游移植过程记录（一次性工作文件）
+plan_port_upstream/
+
 # Visual Studio
 .vs/
 restore_commit.txt
@@ -135,5 +150,6 @@ reflect/*
 **/__pycache__/
 
 .claude/
-. c o d e g r a p h /  
+. c o d e g r a p h / 
+ 
  
