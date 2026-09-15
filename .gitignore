@@ -124,6 +124,7 @@ memory/L4_raw_sessions/*
 
 # Streamlit 面板开发与无头验证 SOP (2026-09-15)
 !memory/streamlit_ui_sop.md
+!memory/upstream_port_sop.md
 
 # FreeFileSync 同步配置（本机工具状态，不入库）
 sync.ffs_db
