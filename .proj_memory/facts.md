@@ -108,3 +108,21 @@
   - **2026-08-22 补充**: vision 已切换 Responses API 模式。`deepseek_vision_config` 加 `'api_mode': 'responses'`；`memory/vision_api.py` 的 `_call_openai_compat` 新增 responses 分支（POST /v1/responses, input 用 input_text/input_image, 解析 output[] 中 message.content[].output_text）。实测成功。主会话 native_oai_config 本就 api_mode='responses'（llmcore.py L484 auto_make_url "responses"）。
 
 - **2026-08-22 scheduler 恢复**: weekly_memory_tidy 因 launch.pyw 未带 --sched 参数导致 scheduler 未运行而漏执行。已手动补做(报告 done/2026-08-22)。scheduler 正确启动方式: `python agentmain.py --reflect reflect/scheduler.py --llm_no 0`(不能直接跑 scheduler.py, 无入口)。已启动: 主进程+reflect子进程+端口45762锁。**教训: launch.pyw --feishu 不带 --sched 则定时任务不跑**。
+
+## 2026-09-15 上游 A/B 级移植完成 (commit cf073b3)
+- 上游基线更新: upstream/main = 1b6442f (2026-09-14, 37 个新提交)；评估报告 `plan_port_upstream/upstream_2026-09-14_report.md`
+- 已移植（全部 py_compile + 实测）：
+  - A1 abort 唤醒"等响应头"中阻塞的 recv（llmcore `_INFLIGHT` + urllib3 request hook；agentmain.abort 加 `_real_close()`）→ 实测 8s→0.00s
+  - A2 重试退避可中断 `_sleep()` → 实测 30s→1.63s
+  - A3 `trim_messages_history` 线性化 → 120→8 msgs 用时 9ms
+  - A4 完成判定 `content[50:][-100:]`；A5 session_id `str()` 强转（ga.py 两处 + TMWebDriver.py）
+  - B1 TTFT/decode-TPS 统计（本地 SSE mock 端到端实测通过）；B2 UA→2.1.251；B3 ctx 38000/cut 8
+  - B4 去掉 claude `context_management` payload；B5 `api_key_header`(auto|x-api-key|bearer)
+  - B6 新增 WS hub（frontends/hub.py + hub.html + hub_p2p.py + p2p_ws_client.py）→ 假 agent 实测 llms 列表/切换/越界均正确
+  - B7 conductor 模型选择（/llms /llm 端点 + WS `llm`/`model_selected` 广播 + 任务边界应用）→ 集成实测通过
+  - B8 cost_tracker jsonl 账本（跨进程/10MB 压缩/坏行容错）→ 往返测试通过
+  - B10 frontends/data_backup.py（857 行，零第三方依赖）；B11 提示词（摘要措辞/宪法去重/remember 成功判定）
+- **未移植 B9**（stapp 流式修复）：本地 stapp 是同步渲染架构，与上游 fragment tick 架构不同源，主体不适用；且本机 streamlit 1.57 < 上游要求 1.62
+- **生效需重启**：运行中的 `agentmain.py --reflect ...` 与 `frontends/fsapp.py` 仍加载旧代码
+- 备份：`bak/port_ab_20260915/`（本次改动前的原件；注意 `.gitignore` 未忽略 bak/，勿误提交）
+- 下次对比基线：upstream **1b6442f**
