@@ -91,3 +91,20 @@
   - 保留本地独有: switch_tier/switch_model/MixinSession(_raw_ask 回退)/_cn schema/CDP(cdp_cfg+tmwd_cdp_bridge)/GeneraticAgent 别名/agent_loop SquillaRouter 集成。
   - 独立验证 subagent VERDICT: PASS；detail: plan_port_upstream/。
   - 注意: squilla_router/ 3 文件 + sync.ffs_db 有用户未提交改动，未混入本次提交。
+
+- 2026-09-15: 上游增量评估（基线 f06d550 → upstream/main=1b6442f，2026-09-14，37 个新提交）。
+  - 报告: `plan_port_upstream/upstream_2026-09-14_report.md`；diff 全文 `plan_port_upstream/u2_*.diff`。
+  - A 级可直收（本地全未含，均低风险）: ①abort() 唤醒等响应头中阻塞的 recv（llmcore 头部 _INFLIGHT+socket hook，agentmain.py abort() 加 `_real_close()`；上游 f07bfc5/3d62523）②重试退避可中断 `_sleep()`（llmcore `_stream_with_retry`）③`trim_messages_history` 线性化（0c235a8）④ga.py 完成判定 `content[50:][-100:]`（3327a6c）⑤`str(session_id/switch_tab_id)` 强转（71cf559）。
+  - B 级按需: TTFT/TPS 统计、UA 2.1.152→2.1.251、context_win 38000/cut 8、禁用 claude `context_management`、NativeClaude `api_key_header`、hub 远程切 LLM、conductor 模型选择加固、cost_tracker jsonl 账本、data_backup.py、stapp 流式修复（需 streamlit>=1.62，本机 1.57）。
+  - C 级不吸收: Desktop 2.0 全套（React/Tauri/CI/发布资格，需 npm+rust）、vision_sop 默认后端变更（本机 deepseek vision 为本地独有）、wechatapp conductor 修复（本地无该逻辑）。
+  - 长期约束: 分叉严重不能 merge，只能手动 patch；本地独有（SquillaRouter/_cn schema/CDP/fsapp sleep/vision deepseek）不可破坏。
+
+- 2026-08-14: 飞书通道新增远程S3睡眠命令。`frontends/fsapp.py` FeishuApp override `handle_command` 支持 `/sleep` `/s3` `/s3sleep [秒]`（默认3s，上限60s）→ 调 `temp/s3_sleep2.ps1`(SetSuspendState+日志) 进入S3睡眠；不依赖LLM直达。fsapp.py 长连接 main() 自带重连，唤醒后自动恢复。mykey.py `fs_allowed_users` 为 "*" (public模式，任意飞书用户可发命令)。重启方式：杀旧 fsapp 进程后 `.venv\Scripts\python.exe frontends/fsapp.py`（日志 temp/fsapp_restart.log）。
+
+- 2026-08-22: 配置 DeepSeek V4 flash vision exp 到 `mykey.py`（`deepseek_vision_config`），`memory/vision_api.py` 的 `OPENAI_CONFIG_KEY` 已指向它（主用；ARK doubao 与本地 8090 为备选）。
+  - 模型名: `deepseek-v4-flash-vision-exp`，端点 `https://api.deepseek.com/v1`（OpenAI 兼容 /v1/chat/completions），复用 `DEEPSEEK_API_KEY`（与 native_oai_config 同一 key）。
+  - 文档: https://api-docs.deepseek.com/guides/vision — 图片格式 JPEG/PNG/GIF/WebP，内联 base64 ≤48MiB，URL ≤8192 字符/32MiB，Files API ≤64MiB。
+  - 实测: ask_vision 中文描述测试图成功（蓝色方框+红色圆圈识别正确）。vision_api.py 的 `_call_openai_compat` 已兼容（apibase 以 /v1 结尾自动拼 /chat/completions）。
+  - **2026-08-22 补充**: vision 已切换 Responses API 模式。`deepseek_vision_config` 加 `'api_mode': 'responses'`；`memory/vision_api.py` 的 `_call_openai_compat` 新增 responses 分支（POST /v1/responses, input 用 input_text/input_image, 解析 output[] 中 message.content[].output_text）。实测成功。主会话 native_oai_config 本就 api_mode='responses'（llmcore.py L484 auto_make_url "responses"）。
+
+- **2026-08-22 scheduler 恢复**: weekly_memory_tidy 因 launch.pyw 未带 --sched 参数导致 scheduler 未运行而漏执行。已手动补做(报告 done/2026-08-22)。scheduler 正确启动方式: `python agentmain.py --reflect reflect/scheduler.py --llm_no 0`(不能直接跑 scheduler.py, 无入口)。已启动: 主进程+reflect子进程+端口45762锁。**教训: launch.pyw --feishu 不带 --sched 则定时任务不跑**。

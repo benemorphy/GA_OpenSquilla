@@ -1,6 +1,11 @@
 import os, json, re, time, requests, sys, threading, urllib3, base64, importlib, uuid, pathlib
 from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+_INFLIGHT = {}  # thread ident -> 已建立并已发送请求的 socket；让 abort() 在"响应头还没到"时也能掐断 recv()
+_orig_conn_request = urllib3.connection.HTTPConnection.request
+def _conn_request_hook(self, *a, **k):  # request() 返回后连接已建立+发送完成，conn.sock 之后可能被 http.client 置 None
+    r = _orig_conn_request(self, *a, **k); _INFLIGHT[threading.get_ident()] = self.sock; return r
+urllib3.connection.HTTPConnection.request = _conn_request_hook
 _RESP_CACHE_KEY = str(uuid.uuid4()); _RESP_CODEX_KEY = str(uuid.uuid4())
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path: sys.path.append(_ROOT)
@@ -109,11 +114,16 @@ def trim_messages_history(history, sess):
     if c <= cap: return
     compress_history_tags(history, keep_recent=4, force=True)
     if cost(history) <= target: return
-    pre, post = history[:kp], history[kp:]
-    while len(post) > 9 and cost(pre) + cost(post) > target:
-        post.pop(0)
-        while post and post[0].get('role') != 'user': post.pop(0)
-        if post and post[0].get('role') == 'user': post[0] = _sanitize_leading_user_msg(post[0])
+    # 线性推进：预算每条消息的 json 长度，避免每轮重算全量 cost（原实现 O(n^2)）
+    pre, post = history[:kp], history[kp:]; costs = [len(json.dumps(m, ensure_ascii=False)) for m in post]
+    c = cost(pre) + sum(costs); i = 0
+    while len(post) - i > 9 and c > target:
+        c -= costs[i]; i += 1
+        while i < len(post) and post[i].get('role') != 'user': c -= costs[i]; i += 1
+        if i < len(post):
+            old = costs[i]; post[i] = _sanitize_leading_user_msg(post[i])
+            costs[i] = len(json.dumps(post[i], ensure_ascii=False)); c += costs[i] - old
+    post = post[i:]
     if kp and pre:
         m = pre[-1]
         if m.get('role') == 'assistant' and isinstance(m.get('content'), list):
@@ -438,9 +448,20 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
         try: ra = float((resp.headers or {}).get("retry-after"))
         except: ra = None
         return None if ra and ra > cap else max(0.5, ra or min(30.0, 3.0 * (2 ** attempt)))
+    def _stopped(): return bool(getattr(sess, 'should_stop', None)) and sess.should_stop()
+    def _sleep(d):  # 可中断退避；被中止时返回 True
+        end = time.time() + d
+        while time.time() < end:
+            if _stopped(): return True
+            time.sleep(0.2)
+        return _stopped()
     for attempt in range(sess.max_retries + 1):
+        if _stopped(): return []
         streamed = False
+        STATS.update(t_start=time.time(), t_ttft=None)
+        if not sess.stream: STATS['t_ttft'] = STATS['t_start']
         try:
+            sess._tid = threading.get_ident()  # abort() 通过 _INFLIGHT[_tid] 找 socket
             with requests.post(url, headers=headers, json=payload, stream=sess.stream, 
                                timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies, verify=sess.verify) as r:
                 sess.active_response = r
@@ -449,16 +470,31 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
                     d = _delay(r, attempt) if r.status_code in _RETRYABLE and attempt < sess.max_retries else None
                     if d is not None:
                         print(f"[LLM Retry] HTTP {r.status_code}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
-                        time.sleep(d); continue
+                        if _sleep(d): return []
+                        continue
                     try: body = r.text.strip()[:500]
                     except: body = ""
                     err = f"!!!Error: HTTP {r.status_code}" + (f" (retry-after > {cap:.0f}s)" if d is None and r.status_code in _RETRYABLE and attempt < sess.max_retries else "") + (f": {body}" if body else "")
                     yield err; return [{"type": "text", "text": err}]
+                if sess.stream:  # TTFT 取首个 SSE 事件（prefill 完成），隐藏 thinking 也要计入解码窗口
+                    _il = r.iter_lines
+                    def _probe(*a, **k):
+                        for line in _il(*a, **k):
+                            if line and STATS.get('t_ttft') is None: STATS['t_ttft'] = time.time()
+                            yield line
+                    r.iter_lines = _probe
                 gen = parse_fn(r)
                 try:
-                    while True: chunk = next(gen); streamed = True; yield chunk
+                    while True:
+                        if _stopped():
+                            STATS['t_end'] = time.time(); return []
+                        chunk = next(gen)
+                        if chunk and STATS.get('t_ttft') is None: STATS['t_ttft'] = time.time()
+                        streamed = True; yield chunk
                 except StopIteration as e:
                     if not e.value and not streamed: raise requests.ConnectionError("empty response")
+                    STATS['t_end'] = time.time()
+                    STATS['tps'] = STATS.get('out', 0) / max(1e-9, STATS['t_end'] - max(STATS.get('t_ttft') or 0, STATS['t_start']))
                     return e.value or []
         except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
             err = f"!!!Error: {type(e).__name__}: {e}" if str(e) else f"!!!Error: {type(e).__name__}"
@@ -466,7 +502,8 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
             if attempt < sess.max_retries:
                 d = _delay(None, attempt)
                 print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
-                time.sleep(d); continue
+                if _sleep(d): return []
+                continue
             yield err; return [{"type": "text", "text": err}]
         except Exception as e:
             err = f"\n\n[!!! 流异常中断 {type(e).__name__}: {e} !!!]" if streamed else f"!!!Error: {type(e).__name__}: {e}"
@@ -601,7 +638,7 @@ class BaseSession:
         self.api_key = cfg['apikey']
         self.api_base = cfg['apibase'].rstrip('/')
         self.model = cfg.get('model', '')
-        default_context_win = 35000; default_cut_msg_interval = 7
+        default_context_win = 38000; default_cut_msg_interval = 8
         if 'deepseek' in self.model.lower():
             default_context_win = 80000; default_cut_msg_interval = 25; self.trim_keep_rate = 0.3
         self.context_win = cfg.get('context_win', default_context_win)
@@ -634,7 +671,7 @@ class BaseSession:
         self.api_mode = 'responses' if mode in ('responses', 'response') else 'chat_completions'
         self.temperature = cfg.get('temperature', 1)
         self.max_tokens = cfg.get('max_tokens')
-        self.default_ua = "claude-cli/2.1.152 (external, cli)"
+        self.default_ua = "claude-cli/2.1.251 (external, cli)"
         self.user_agent = cfg.get("user_agent", self.default_ua)
 
     def switch_model(self, model_name: str, tier: str = "c1"):
@@ -765,7 +802,7 @@ def _fix_messages(messages):
     return merged
 
 class NativeClaudeSession(BaseSession):
-    native_ua = "claude-cli/2.1.152 (native, cli)"
+    native_ua = "claude-cli/2.1.251 (native, cli)"
     def __init__(self, cfg):
         super().__init__(cfg)
         self.fake_cc_system_prompt = cfg.get("fake_cc_system_prompt", False)
@@ -774,6 +811,7 @@ class NativeClaudeSession(BaseSession):
         self._device_id = uuid.uuid4().hex + uuid.uuid4().hex[:32]
         self.tools = None
         if self.user_agent == self.default_ua: self.user_agent = self.native_ua
+        self.api_key_header = str(cfg.get('api_key_header', 'auto')).strip().lower()
     def raw_ask(self, messages):
         if self.max_tokens is None: self.max_tokens = 8192
         model = self.model
@@ -787,13 +825,15 @@ class NativeClaudeSession(BaseSession):
             "anthropic-beta": ",".join(beta_parts), "anthropic-dangerous-direct-browser-access": "true",
             "user-agent": self.user_agent, "x-app": "cli"}
         headers.update({"Accept": "application/json", "X-Claude-Code-Session-Id": self._session_id, "X-Stainless-Arch": "x64", "X-Stainless-Lang": "js", "X-Stainless-OS": "Windows", "X-Stainless-Package-Version": "0.94.0", "X-Stainless-Retry-Count": "0", "X-Stainless-Runtime": "node", "X-Stainless-Runtime-Version": "v24.3.0", "X-Stainless-Timeout": "600"})
-        if self.api_key.startswith("sk-ant-"): headers["x-api-key"] = self.api_key
+        if self.api_key_header == 'x-api-key': headers["x-api-key"] = self.api_key
+        elif self.api_key_header == 'bearer': headers["authorization"] = f"Bearer {self.api_key}"
+        elif self.api_key.startswith("sk-ant-"): headers["x-api-key"] = self.api_key
         else: headers["authorization"] = f"Bearer {self.api_key}"
         payload = {"model": model, "messages": messages, "max_tokens": self.max_tokens, "stream": self.stream}
         #if self.fake_cc_system_prompt: payload["max_tokens"] = 64000
         if self.temperature != 1: payload["temperature"] = self.temperature
         self._apply_claude_thinking(payload)
-        payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}; 
+        #payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}  # 上游 3f39e2b 禁用：部分端点不认
         if self.fake_cc_system_prompt:
             if 'thinking' not in payload: payload["thinking"] = {"type": "adaptive"}
             if 'output_config' not in payload: payload["output_config"] = {"effort": "medium"}

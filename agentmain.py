@@ -127,6 +127,15 @@ class GenericAgent:
         if self.handler is not None: self.handler.code_stop_signal.append(1)
         for sess in getattr(self.llmclient.backend, '_sessions', [self.llmclient.backend]):
             sess.should_stop = lambda: self.stop_sig  # live read; cleared by run()'s finally
+            try:  # 唤醒阻塞在 recv() 的线程（无论等响应头还是读流）。Windows 实测：
+                  # shutdown()/close() 唤不醒（makefile 引用计数使 closesocket 延后）；_real_close() 可以
+                import socket as _socket
+                sock = sys.modules['llmcore']._INFLIGHT[sess._tid]  # socket 在 urllib3 request() 时登记，早于响应头
+                try: sock.shutdown(_socket.SHUT_RDWR)  # 非 Windows 语义
+                except OSError: pass
+                try: sock._real_close()  # CPython 内部实现；绕过引用计数真正 closesocket
+                except AttributeError: sock.close()
+            except Exception: pass
             try: sess.active_response.close()
             except Exception: pass
             

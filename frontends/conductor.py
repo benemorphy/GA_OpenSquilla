@@ -114,6 +114,150 @@ async def broadcast(payload: dict):
 
 def push_cards(): schedule_broadcast({"type": "subagents", "items": pool.snapshot()})
 
+# ---- 模型绑定：把桌面设置里 conductor 绑定的 LLM 编号应用到总管会话 ----
+# 上游设计要点：绑定值只持久化，不在任务进行中改 live client；下一个任务边界才生效。
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".ga_desktop_settings.json")
+
+
+def _settings_doc() -> dict:
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            doc = json.load(f)
+        return doc if isinstance(doc, dict) else {}
+    except Exception:
+        return {}
+
+
+def _persist_conductor_llm_no(llm_no: int) -> None:
+    """只改 conductor.llmNo 一段，写回时保留文件其它内容。"""
+    doc = _settings_doc()
+    section = doc.get("conductor")
+    if not isinstance(section, dict):
+        section = {}
+        doc["conductor"] = section
+    section["llmNo"] = llm_no
+    tmp = SETTINGS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, SETTINGS_PATH)
+
+
+def _conductor_llm_no() -> Optional[int]:
+    """读总管绑定的模型编号；兼容旧版桌面默认值 ui.llmNo。"""
+    doc = _settings_doc()
+    for section in (doc.get("conductor"), doc.get("ui")):
+        if isinstance(section, dict) and section.get("llmNo") is not None:
+            try:
+                return int(section.get("llmNo"))
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _client_usable(agent: "GenericAgent") -> bool:
+    return hasattr(getattr(agent, "llmclient", None), "backend")
+
+
+def _parse_model_no(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _usable_model(agent: "GenericAgent", no: Optional[int]) -> bool:
+    clients = getattr(agent, "llmclients", []) or []
+    return no is not None and 0 <= no < len(clients) and hasattr(clients[no], "backend")
+
+
+def _activate_model(agent: "GenericAgent", no: int) -> None:
+    if not _usable_model(agent, no):
+        raise ValueError(f"llm index out of range or unavailable: {no}")
+    agent.next_llm(no)
+
+
+def _runtime_model_state(agent: "GenericAgent", configured: Optional[int], reason: Optional[str]) -> dict:
+    effective = getattr(agent, "llm_no", None) if _client_usable(agent) else None
+    current = None
+    if _client_usable(agent):
+        try:
+            current = str(agent.llmclient.backend.name)
+        except Exception:
+            pass
+    return {"configured": configured, "effective": effective,
+            "fallbackReason": reason, "current": current}
+
+
+def _apply_desktop_model(agent: "GenericAgent") -> dict:
+    """任务开始前让总管会话对齐当前绑定：
+    有绑定就切过去；没有也要刷新 mykey（否则导入密钥后不重启永远不生效）。
+    失败逐级降级：绑定值 → ui 默认值 → 第一个可用模型。"""
+    doc = _settings_doc()
+    conductor_cfg = doc.get("conductor") if isinstance(doc.get("conductor"), dict) else {}
+    ui_cfg = doc.get("ui") if isinstance(doc.get("ui"), dict) else {}
+    raw_configured = conductor_cfg.get("llmNo")
+    configured = _parse_model_no(raw_configured)
+    ui_default = _parse_model_no(ui_cfg.get("llmNo"))
+
+    try:
+        agent.load_llm_sessions()   # mtime 保护：mykey 变了才重建
+    except Exception as e:
+        print(f"[conductor] failed to refresh model sessions: {e}", file=sys.stderr)
+
+    clients = getattr(agent, "llmclients", []) or []
+
+    configured_failed = False
+    if _usable_model(agent, configured):
+        try:
+            _activate_model(agent, configured)
+            return _runtime_model_state(agent, configured, None)
+        except Exception as e:
+            configured_failed = True
+            print(f"[conductor] configured model #{configured} is unavailable: {e}", file=sys.stderr)
+
+    if _usable_model(agent, ui_default):
+        if raw_configured is None:
+            reason = "ui_default"
+        elif configured_failed:
+            reason = "configured_unavailable"
+        elif configured is not None:
+            reason = "configured_unavailable" if 0 <= configured < len(clients) else "invalid_configured"
+        else:
+            reason = "invalid_configured"
+        try:
+            _activate_model(agent, ui_default)
+            return _runtime_model_state(agent, configured, reason)
+        except Exception as e:
+            print(f"[conductor] UI default model #{ui_default} is unavailable: {e}", file=sys.stderr)
+
+    for i, client in enumerate(clients):
+        if hasattr(client, "backend"):
+            try:
+                _activate_model(agent, i)
+                return _runtime_model_state(agent, configured, "first_available")
+            except Exception:
+                continue
+
+    print("[conductor] no usable model is available", file=sys.stderr)
+    return {"configured": configured, "effective": None,
+            "fallbackReason": "no_models", "current": None}
+
+
+def _selected_conductor_llm_no(agent: "GenericAgent") -> int:
+    configured = _conductor_llm_no()
+    return configured if _usable_model(agent, configured) else getattr(agent, "llm_no", -1)
+
+
+def _set_conductor_llm_no(agent: "GenericAgent", value: Any) -> int:
+    """持久化绑定但不改 in-flight 客户端；总管循环在下个任务边界应用。"""
+    no = _parse_model_no(value)
+    if no is None or not _usable_model(agent, no):
+        raise ValueError(f"llm index out of range or unavailable: {value}")
+    _persist_conductor_llm_no(no)
+    return no
+
 def add_chat(msg: str, role: str = "conductor"):
     item = {"id": short_id(), "role": role, "msg": msg, "ts": now_ms(), "read": role != "user"}
     chat_messages.append(item)
@@ -271,6 +415,10 @@ class Conductor:
         self.agent: Optional[GenericAgent] = None
         self.started = False
         self.log: list = []   
+        self._model_lock = threading.Lock()
+        self._model_state: dict = {"configured": None, "effective": None,
+                                   "fallbackReason": None, "current": None, "running": False}
+        self._runner_thread = None
 
     def notify(self, event: dict): self.inbox.put(event)
 
@@ -323,10 +471,29 @@ API: {base}；先requests，GET /readme查用法，GET /chat读未读对话，GE
                 print("Conductor task done")
                 return
 
+    def model_snapshot(self) -> dict:
+        with self._model_lock:
+            return dict(self._model_state)
+
+    def _publish_model_state(self, state: dict, running: bool) -> None:
+        snapshot = {**state, "running": bool(running)}
+        with self._model_lock:
+            self._model_state = snapshot
+        schedule_broadcast({"type": "model", "model": snapshot})
+
+    def _record_unavailable_model(self, events: list) -> None:
+        item = {"id": short_id(), "ts": now_ms(),
+                "event": ",".join(e.get("type", "") for e in events) or "wake",
+                "turn": None,
+                "text": "Conductor paused: no usable model profiles are configured; events are deferred."}
+        self.log.append(item)
+        if len(self.log) > self.LOG_MAX: self.log.pop(0)
+        schedule_broadcast({"type": "log", "item": item})
+
     def _run(self):
         self.agent = GenericAgent()
         self.agent.inc_out = True
-        start_agent_runner(self.agent, "conductor-agent")
+        self._runner_thread = start_agent_runner(self.agent, "conductor-agent")
         self.started = True
         while True:
             # Block until first event arrives
@@ -334,7 +501,8 @@ API: {base}；先requests，GET /readme查用法，GET /chat读未读对话，GE
             self.inbox.task_done()
             # Short debounce: collect any additional events that arrived meanwhile
             time.sleep(0.3)
-            events = [first]
+            events = [*deferred_events, first]
+            deferred_events = []
             while not self.inbox.empty():
                 try:
                     events.append(self.inbox.get_nowait())
@@ -342,12 +510,25 @@ API: {base}；先requests，GET /readme查用法，GET /chat读未读对话，GE
                 except Exception:
                     break
             try:
+                # 设置可能在进程存活期间变化；只在任务边界刷新，使 in-flight 任务保留原客户端
+                model_state = _apply_desktop_model(self.agent)
+                if model_state.get("effective") is None:
+                    self._publish_model_state(model_state, running=False)
+                    self._record_unavailable_model(events)
+                    deferred_events = events
+                    continue
                 prompt = self._build_prompt(events)
-                dq = self.agent.put_task(prompt, source="conductor")
-                self._drain(dq, events)
+                self._publish_model_state(model_state, running=True)
+                try:
+                    dq = self.agent.put_task(prompt, source="conductor")
+                    self._drain(dq, events)
+                finally:
+                    self._publish_model_state(model_state, running=False)
             except Exception as e: print(f"Conductor error: {e}")
 
-    def start(self): threading.Thread(target=self._run, name="conductor-loop", daemon=True).start()
+    def start(self):
+        # 起线程前先做一次模型对齐，避免前端首次连接时状态为空
+        threading.Thread(target=self._run, name="conductor-loop", daemon=True).start()
 
 
 conductor = Conductor()
@@ -395,6 +576,24 @@ def im_prompt(source: str):
     if source not in IM_PROMPTS:
         return PlainTextResponse(f"Unknown source: {source}. Available: {', '.join(IM_PROMPTS.keys())}", status_code=404)
     return PlainTextResponse(IM_PROMPTS[source])
+
+@app.get("/llms")
+def api_llms():
+    if not conductor.agent: return {"cur": -1, "items": []}
+    return {"cur": _selected_conductor_llm_no(conductor.agent),
+            "items": conductor.agent.list_llms(), "model": conductor.model_snapshot()}
+
+
+@app.post("/llm")
+def api_llm(body: dict):
+    if not conductor.agent: return JSONResponse({"error": "conductor not started"}, status_code=503)
+    try:
+        no = _set_conductor_llm_no(conductor.agent, body.get("no"))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    schedule_broadcast({"type": "model_selected", "llm": no})
+    return {"ok": True, "llm": no}
+
 
 @app.get("/subagent")
 def list_subagents(): return {"items": pool.snapshot()}
@@ -459,9 +658,21 @@ async def websocket(ws: WebSocket):
     await ws.accept()
     ws_clients.add(ws)
     try:
-        await ws.send_json({"type": "hello", "subagents": pool.snapshot(), "chat": chat_messages, "log": conductor.log})
+        await ws.send_json({"type": "hello", "subagents": pool.snapshot(), "chat": chat_messages, "log": conductor.log,
+                            "model": conductor.model_snapshot(),
+                            "llms": conductor.agent.list_llms() if conductor.agent else [],
+                            "llm": _selected_conductor_llm_no(conductor.agent) if conductor.agent else -1})
         while True:
             data = await ws.receive_json()
+            if "llm" in data:
+                # 只持久化绑定；运行中的任务不受影响，下个任务边界生效
+                try:
+                    no = _set_conductor_llm_no(conductor.agent, data.get("llm"))
+                    schedule_broadcast({"type": "model_selected", "llm": no})
+                except Exception as e:
+                    schedule_broadcast({"type": "model_error", "error": str(e),
+                                        "llm": _selected_conductor_llm_no(conductor.agent)})
+                continue
             msg = (data.get("msg") or "").strip()
             if not msg: continue
             add_chat(msg, role="user")

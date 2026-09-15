@@ -161,6 +161,7 @@
       border-bottom: 1px solid rgba(245,158,11,.18);
     }
     .approvals .title { display: inline-flex; align-items: center; gap: 8px; }
+    #llm { max-width: 42vw; margin-left: 10px; padding: 4px 6px; border: 1px solid #dfe5ee; border-radius: 6px; background: #fff; font: 600 12px inherit; }
     .badge {
       font-size: 11px; font-weight: 800; color: #fff;
       background: var(--amber); border-radius: 99px; padding: 2px 9px;
@@ -306,7 +307,7 @@
       <!-- 聊天 -->
       <section class="pane chat">
         <div class="head">
-          <div class="title">Conversation</div>
+          <div class="title">Conversation <select id="llm" aria-label="Conductor model" disabled></select></div>
           <div class="hint" id="wsStatus">connecting...</div>
         </div>
         <div class="messages" id="messages"></div>
@@ -333,6 +334,7 @@
     const consoleBar = document.getElementById('consoleBar');
     const consoleBody= document.getElementById('consoleBody');
     const logCount   = document.getElementById('logCount');
+    const llmEl      = document.getElementById('llm');
     let ws;
 
     function esc(s){ return String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -446,7 +448,16 @@
           renderCards(data.subagents||[]);
           messagesEl.innerHTML=''; (data.chat||[]).forEach(addMsg);
           renderLog(data.log||[]);
-        } else if(data.type==='subagents'){ renderCards(data.items||[]); }
+          llmEl.innerHTML=(data.llms||[]).map(x=>`<option value="${x[0]}">${esc(x[1])}</option>`).join(''); llmEl.value=data.llm; llmEl.disabled=!llmEl.options.length;
+        } else if(data.type==='model_selected'){ llmEl.value=String(data.llm); }
+        else if(data.type==='model'){
+          if(data.model && data.model.current) llmEl.title=`运行中: ${data.model.current}${data.model.fallbackReason?(' · 回退: '+data.model.fallbackReason):''}`;
+        }
+        else if(data.type==='model_error'){
+          if(data.llm!==undefined) llmEl.value=String(data.llm);
+          alert(data.error||'Failed to select model');
+        }
+        else if(data.type==='subagents'){ renderCards(data.items||[]); }
         else if(data.type==='chat'){ addMsg(data.item); }
         else if(data.type==='chat_read'){ markAllRead(); }
         else if(data.type==='log'){ appendLog(data.item); }
@@ -458,6 +469,7 @@
       if(!msg || !ws || ws.readyState!==WebSocket.OPEN) return;
       ws.send(JSON.stringify({msg})); inputEl.value=''; inputEl.focus();
     }
+    llmEl.addEventListener('change', ()=>{ if(ws && ws.readyState===1) ws.send(JSON.stringify({llm:+llmEl.value})); });
     sendBtn.addEventListener('click', send);
     inputEl.addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey && !e.isComposing && e.keyCode!==229){ e.preventDefault(); send(); } });
 
